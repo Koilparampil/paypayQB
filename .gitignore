@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# paypayQB project-specific
+.qbo_browser_session/
+inv_booking_nums.csv
