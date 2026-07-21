@@ -27,7 +27,7 @@ import re
 import sys
 import traceback
 from pathlib import Path
-
+from datetime import datetime
 from dotenv import load_dotenv
 from playwright.sync_api import Page, expect, sync_playwright, TimeoutError as PWTimeout
 
@@ -38,12 +38,13 @@ QBO_WEB          = "https://qbo.intuit.com"
 BILL_PAYMENT_URL = f"{QBO_WEB}/app/billpayment"
 # Same persistent profile as ETAutomations, so an existing QBO login is reused.
 SESSION_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "QB-APITesting" / "qbo_browser_session"
+PROFILE_DIR = Path(__file__).with_name("maersk_profile")
 QB = os.getenv("QB") if os.getenv("QB") is not None else ""
 
-PAYEE_NAME      = "MAERSK"
-PAYMENT_ACCOUNT = "Wells Fargo"
-CSV_NAME        = "inv_booking_nums.csv"
-
+LOGIN_TIMEOUT_MS = 5 * 60 * 1000  # up to 5 minutes to log in manually
+PAYEE_NAME      = os.getenv("PAYEE_NAME_2") if os.getenv("PAYEE_NAME_2") is not None else ""
+PAYMENT_ACCOUNT = os.getenv("PAYMENT_ACCOUNT_2") if os.getenv("PAYMENT_ACCOUNT_2") is not None else ""
+CSV_NAME        = os.getenv("CSV_NAME_2") if os.getenv("CSV_NAME_2") is not None else ""
 
 # ── QuickBooks login logic (from ETAutomations) ────────────────────────────────
 def _is_on_auth_page(page) -> bool:
@@ -66,7 +67,7 @@ def launch_and_login(pw):
     context = pw.chromium.launch_persistent_context(
         str(SESSION_DIR),
         headless=False,  # the run ends with a manual review/submit step
-        slow_mo=200,
+        slow_mo=20,
         viewport={"width": 1440, "height": 900},
     )
     page = context.new_page()
@@ -83,8 +84,8 @@ def launch_and_login(pw):
 
 # ── CSV loading ────────────────────────────────────────────────────────────────
 def load_booking_rows(csv_path: Path) -> list:
-    """Parse {inv_num},{bookingNumber},{open_balance} lines into
-    [{"inv_num": ..., "booking_num": ..., "balance": ...}, ...]."""
+    """Parse {BL_num},{bookingNumber},{open_balance} lines into
+    [{"BL_num": ..., "booking_num": ..., "balance": ...}, ...]."""
     if not csv_path.exists():
         sys.exit(f"CSV file not found: {csv_path}")
 
@@ -96,7 +97,7 @@ def load_booking_rows(csv_path: Path) -> list:
             if len(row) < 3:
                 print(f"  [CSV] Line {line_num}: expected 'inv_num,booking,balance' — skipping {row!r}")
                 continue
-            inv_num = row[0].strip()
+            inv_num = row[0].strip()[4:]
             booking = row[1].strip()
             # Join the remaining cells so an unquoted thousands separator
             # ("1,250.00" split across two cells) still comes through intact.
@@ -106,9 +107,16 @@ def load_booking_rows(csv_path: Path) -> list:
             if not inv_num or not booking or not balance:
                 print(f"  [CSV] Line {line_num}: empty field — skipping {row!r}")
                 continue
-            entries.append({"inv_num": inv_num, "booking_num": booking, "balance": balance})
+            entries.append({"BL_num": inv_num, "booking_num": booking, "balance": balance})
     return entries
 
+# ── CSV UNloading ────────────────────────────────────────────────────────────────
+def unload_completed_rows(data: list):
+    headers = data[0].keys()
+    with open("output.csv", mode="w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=headers)
+        writer.writeheader()  # Writes the header row (name, age, city)
+        writer.writerows(data)  # Writes all dictionary data rows
 
 # ── Pay Bills page helpers ─────────────────────────────────────────────────────
 def _fill_typeahead(page: Page, locator, value: str, label: str):
@@ -116,11 +124,11 @@ def _fill_typeahead(page: Page, locator, value: str, label: str):
     locator.wait_for(state="visible", timeout=60_000)
     locator.click()
     locator.fill("")
-    locator.press_sequentially(value, delay=80)
-    page.wait_for_timeout(1_500)  # give the suggestion list time to populate
+    locator.press_sequentially(value, delay=40)
+    page.wait_for_timeout(1000)  # give the suggestion list time to populate
     locator.press("Enter")
     page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(2_000)  # let the bills table refresh
+    page.wait_for_timeout(500)  # let the bills table refresh
     print(f"  [QBO] {label} set to {value!r}")
 
 
@@ -144,12 +152,12 @@ def _set_select_all(page: Page, checked: bool):
 def _confirm_amount_paid_zero(page: Page):
     """Verify the amount-paid total reads $0.00 before entering payments."""
     amount = page.locator("p[data-testid='amount-value']").first
-    amount.wait_for(state="visible", timeout=30_000)
+    amount.wait_for(state="visible", timeout=10_000)
     scoped = page.locator("p[data-testid='amount-value'][class*='amountPaidValue']")
     if scoped.count() > 0:
         amount = scoped.first
     try:
-        expect(amount).to_have_text("$0.00", timeout=10_000)
+        expect(amount).to_have_text("$0.00", timeout=5_000)
     except AssertionError:
         raise RuntimeError(
             f"Amount-paid check failed: expected $0.00, page shows {amount.inner_text().strip()!r}."
@@ -163,21 +171,28 @@ def enter_payments(page: Page, entries: list) -> list:
     find_bill = page.get_by_test_id("find_bill_no")
     filled_inv_nums = []
     skipped = 0
+    totalpaidIG = 0
     for i, entry in enumerate(entries, start=1):
-        inv_num, booking, balance = entry["inv_num"], entry["booking_num"], entry["balance"]
+        BL_num, booking, balance = entry["BL_num"], entry["booking_num"], entry["balance"]
         print(f"{'─'*50}")
-        print(f"[{i}/{len(entries)}] Invoice {inv_num} · Booking {booking} — payment {balance}")
-
+        print(f"[{i}/{len(entries)}] Invoice {BL_num} · Booking {booking} — payment {balance}")
+        #Check Total < 75000
+        total = page.locator("p[data-testid='amount-value']").first.inner_text()
+        r_total =float(total.replace("$", "").replace(",", ""))
+        if r_total >= 75000:
+            print(f"  [QBO] Total payment {total} exceeds $75,000 — skipping.")
+            skipped += 1
+            continue
         find_bill.click()
         find_bill.fill("")  # clear whatever was searched before
         page.wait_for_timeout(400)
-        find_bill.fill(booking)
+        find_bill.fill(BL_num)
         page.wait_for_load_state("domcontentloaded")
-        page.wait_for_timeout(1_500)  # let the table re-filter
+        page.wait_for_timeout(500)  # let the table re-filter
 
         payment = page.get_by_test_id("outstanding_table_payment_1")
         try:
-            payment.wait_for(state="visible", timeout=15_000)
+            payment.wait_for(state="visible", timeout=5_000)
         except PWTimeout:
             print(f"  [QBO] No bill row found for {booking!r} — skipping.")
             skipped += 1
@@ -185,11 +200,26 @@ def enter_payments(page: Page, entries: list) -> list:
         payment.click()
         payment.fill(balance)
         payment.press("Tab")  # commit the amount so QBO registers the payment
-        page.wait_for_timeout(800)
-        filled_inv_nums.append(inv_num)
-        print(f"  [QBO] Entered {balance} for booking {booking} (invoice {inv_num}).")
+        page.wait_for_timeout(400)
+        #Check Total < 75000
+        total = page.locator("p[data-testid='amount-value']").first.inner_text()
+        r_total =float(total.replace("$", "").replace(",", ""))
+        if r_total >= 75000:
+            print(f"  [QBO] Total payment {total} exceeds $75,000 — skipping.")
+            skipped += 1
+            payment.click()
+            payment.fill("")
+            payment.press("Tab")  # commit the amount so QBO registers the payment
+            page.wait_for_timeout(400)
+            break
+        filled_inv_nums.append({"BL_num": "MEDU" + entry["BL_num"], "booking_num": entry["booking_num"], "balance": entry["balance"]})
+        print(f"  [QBO] Entered {balance} for booking {booking} (invoice {BL_num}).")
+        totalpaidIG += float(balance)
     print(f"{'─'*50}")
-    print(f"Done entering payments: {len(filled_inv_nums)} entered, {skipped} skipped.")
+    print(f"Done entering payments: {len(filled_inv_nums)} entered, {len(entries) - len(filled_inv_nums)} skipped.")
+    filled_inv_nums.append({"BL_num": "", "booking_num": "", "balance": ""})
+    filled_inv_nums.append({"BL_num": "", "booking_num": "Total:", "balance": ""})
+    filled_inv_nums.append({"BL_num": "", "booking_num": "", "balance": totalpaidIG})
     return filled_inv_nums
 
 
@@ -230,17 +260,22 @@ def main():
         _fill_typeahead(page, page.get_by_test_id("payment_account__textField"), PAYMENT_ACCOUNT, "Payment account")
 
         print("  [QBO] Selecting all rows, then clearing the selection...")
+        
+        page.get_by_test_id("settingBtn").first.click(timeout=30_000)
+        page.locator('input[id*="idsDropdownTextField"]').click()
+        page.locator('li[id*="idsMenuItem"]').nth(0).click()
+        page.locator('input[id*="idsDropdownTextField"]').click()
+        page.locator('li[id*="idsMenuItem"]').nth(4).click()
+        
+        
         _set_select_all(page, True)
         _set_select_all(page, False)
         _confirm_amount_paid_zero(page)
 
         filled_inv_nums = enter_payments(page, entries)
+        unload_completed_rows(filled_inv_nums)
+        print(f"{'─'*50}")
 
-        inv_num_string = ",".join(filled_inv_nums)
-        print(f"{'─'*50}")
-        print("Successfully filled invoice numbers:")
-        print(inv_num_string)
-        print(f"{'─'*50}")
 
         print("\nAll payments are keyed in. Review and submit the bill payment in the browser.")
         try:

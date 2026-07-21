@@ -219,4 +219,6 @@ __marimo__/
 
 # paypayQB project-specific
 .qbo_browser_session/
-inv_booking_nums.csv
+*.csv
+*.xlsx
+maersk_profile/
