@@ -22,9 +22,9 @@ Create `inv_booking_nums.csv` next to `payBills.py` (or pass a path on the
 command line). One bill per line, no header needed:
 
 ```csv
-{bookingNumber},{open_balance}
-254545455,1250.00
-254545456,987.65
+{inv_num},{bookingNumber},{open_balance}
+INV-1042,254545455,1250.00
+INV-1043,254545456,987.65
 ```
 
 See `inv_booking_nums.example.csv` for a template. The real CSV is
@@ -51,5 +51,8 @@ What happens:
    waits for the table to filter, and enters the open balance into the
    **Payments** field of the matching row. Bookings with no matching bill
    are reported and skipped.
-5. It stops and waits — review the payment in the browser, submit it
+5. It prints a comma-separated string of the `inv_num`s that were
+   successfully filled (skipped bookings are left out), so you have a record
+   of exactly which invoices were paid.
+6. It stops and waits — review the payment in the browser, submit it
    yourself, then press ENTER in the console to close the browser.

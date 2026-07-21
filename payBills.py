@@ -8,8 +8,8 @@ in a payment amount for every booking listed in inv_booking_nums.csv.
 
 CSV format — one bill per line, no header needed:
 
-    {bookingNumber},{open_balance}
-    e.g.  254545455,1250.00
+    {inv_num},{bookingNumber},{open_balance}
+    e.g.  INV-1042,254545455,1250.00
 
 The browser stays open after the last row so you can review and submit the
 bill payment yourself; press ENTER in this console when you are done.
@@ -83,8 +83,8 @@ def launch_and_login(pw):
 
 # ── CSV loading ────────────────────────────────────────────────────────────────
 def load_booking_rows(csv_path: Path) -> list:
-    """Parse {bookingNumber},{open_balance} lines into
-    [{"booking_num": ..., "balance": ...}, ...]."""
+    """Parse {inv_num},{bookingNumber},{open_balance} lines into
+    [{"inv_num": ..., "booking_num": ..., "balance": ...}, ...]."""
     if not csv_path.exists():
         sys.exit(f"CSV file not found: {csv_path}")
 
@@ -93,19 +93,20 @@ def load_booking_rows(csv_path: Path) -> list:
         for line_num, row in enumerate(csv.reader(fh), start=1):
             if not row or not any(cell.strip() for cell in row):
                 continue  # blank line
-            if len(row) < 2:
-                print(f"  [CSV] Line {line_num}: expected 'booking,balance' — skipping {row!r}")
+            if len(row) < 3:
+                print(f"  [CSV] Line {line_num}: expected 'inv_num,booking,balance' — skipping {row!r}")
                 continue
-            booking = row[0].strip()
+            inv_num = row[0].strip()
+            booking = row[1].strip()
             # Join the remaining cells so an unquoted thousands separator
             # ("1,250.00" split across two cells) still comes through intact.
-            balance = "".join(cell.strip() for cell in row[1:]).replace("$", "").replace(",", "")
+            balance = "".join(cell.strip() for cell in row[2:]).replace("$", "").replace(",", "")
             if line_num == 1 and not re.search(r"\d", balance):
                 continue  # header row
-            if not booking or not balance:
+            if not inv_num or not booking or not balance:
                 print(f"  [CSV] Line {line_num}: empty field — skipping {row!r}")
                 continue
-            entries.append({"booking_num": booking, "balance": balance})
+            entries.append({"inv_num": inv_num, "booking_num": booking, "balance": balance})
     return entries
 
 
@@ -156,14 +157,16 @@ def _confirm_amount_paid_zero(page: Page):
     print("  [QBO] Amount paid confirmed at $0.00.")
 
 
-def enter_payments(page: Page, entries: list):
-    """For each booking, filter the bill list and key in its payment amount."""
+def enter_payments(page: Page, entries: list) -> list:
+    """For each booking, filter the bill list and key in its payment amount.
+    Returns the inv_nums of the rows that were successfully filled."""
     find_bill = page.get_by_test_id("find_bill_no")
-    ok = skipped = 0
+    filled_inv_nums = []
+    skipped = 0
     for i, entry in enumerate(entries, start=1):
-        booking, balance = entry["booking_num"], entry["balance"]
+        inv_num, booking, balance = entry["inv_num"], entry["booking_num"], entry["balance"]
         print(f"{'─'*50}")
-        print(f"[{i}/{len(entries)}] Booking {booking} — payment {balance}")
+        print(f"[{i}/{len(entries)}] Invoice {inv_num} · Booking {booking} — payment {balance}")
 
         find_bill.click()
         find_bill.fill("")  # clear whatever was searched before
@@ -183,10 +186,11 @@ def enter_payments(page: Page, entries: list):
         payment.fill(balance)
         payment.press("Tab")  # commit the amount so QBO registers the payment
         page.wait_for_timeout(800)
-        ok += 1
-        print(f"  [QBO] Entered {balance} for booking {booking}.")
+        filled_inv_nums.append(inv_num)
+        print(f"  [QBO] Entered {balance} for booking {booking} (invoice {inv_num}).")
     print(f"{'─'*50}")
-    print(f"Done entering payments: {ok} entered, {skipped} skipped.")
+    print(f"Done entering payments: {len(filled_inv_nums)} entered, {skipped} skipped.")
+    return filled_inv_nums
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -230,7 +234,13 @@ def main():
         _set_select_all(page, False)
         _confirm_amount_paid_zero(page)
 
-        enter_payments(page, entries)
+        filled_inv_nums = enter_payments(page, entries)
+
+        inv_num_string = ",".join(filled_inv_nums)
+        print(f"{'─'*50}")
+        print("Successfully filled invoice numbers:")
+        print(inv_num_string)
+        print(f"{'─'*50}")
 
         print("\nAll payments are keyed in. Review and submit the bill payment in the browser.")
         try:
